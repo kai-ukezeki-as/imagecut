@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ['python311', 'pip']
+
+[phases.install]
+cmd = 'pip install -r requirements.txt'
+
+[start]
+cmd = 'gunicorn --bind 0.0.0.0:$PORT interactive_splitter:app' 

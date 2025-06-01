@@ -1,0 +1,4 @@
+Pillow>=10.0.0
+Flask>=2.3.0
+gunicorn>=21.0.0
+Werkzeug>=2.3.0 
