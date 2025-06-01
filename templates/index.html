@@ -1310,7 +1310,7 @@
                 return;
             }
             
-            try {
+            try:
                 document.getElementById('splitBtn').disabled = true;
                 document.getElementById('splitBtn').textContent = '処理中...';
                 
@@ -1345,13 +1345,12 @@
                     showDownloadArea(data.details);
                 }
                 
-            } catch (error) {
+            except Exception as e:
                 showStatus('分割に失敗しました: ' + error.message, 'error');
-            } finally {
+            finally:
                 document.getElementById('splitBtn').disabled = false;
                 document.getElementById('splitBtn').textContent = '✂️ 分割実行';
                 updateSplitButtonState();
-            }
         }
 
         // ダウンロードエリアを表示
@@ -1551,7 +1550,7 @@
             const formData = new FormData();
             formData.append('file', file);
             
-            try {
+            try:
                 const dropZone = document.getElementById('dropZone');
                 const originalContent = dropZone.innerHTML;
                 dropZone.innerHTML = '<div style="color: #667eea;">📤 アップロード中...</div>';
@@ -1566,7 +1565,7 @@
                 if (data.error) {
                     showStatus('アップロードに失敗しました: ' + data.error, 'error');
                     dropZone.innerHTML = originalContent;
-                } else {
+                } else:
                     imageData = data.image_data;
                     displayImage(data.image_data);
                     updateImageInfo(data.image_data);
@@ -1579,10 +1578,9 @@
                     `;
                 }
                 
-            } catch (error) {
+            except Exception as e:
                 showStatus('アップロードエラー: ' + error.message, 'error');
                 document.getElementById('dropZone').innerHTML = originalContent;
-            }
         }
 
         // モード切り替え

@@ -10,23 +10,145 @@ import base64
 from pathlib import Path
 from PIL import Image
 import io
+import requests
+import uuid
+import tempfile
 from flask import Flask, render_template, request, jsonify, send_file, send_from_directory
-from image_splitter import ImageSplitter
 
 app = Flask(__name__)
 app.secret_key = 'imagecut_secret_key_2024'
 
 class InteractiveSplitter:
     def __init__(self):
-        self.splitter = ImageSplitter()
         self.current_image_path = None
         self.current_image_data = None
-        self.current_sku = None  # 追加: 現在のSKU
+        self.current_sku = None
+        self.uploaded_images = []
+        self.current_image_index = -1
         
     def set_sku(self, sku):
         """SKUを設定"""
         self.current_sku = sku.strip() if sku else None
         
+    def add_uploaded_image(self, image_path, original_filename):
+        """アップロードされた画像を管理リストに追加"""
+        try:
+            with Image.open(image_path) as img:
+                width, height = img.size
+            
+            image_info = {
+                "path": str(image_path),
+                "filename": original_filename,
+                "url": f"/uploads/{Path(image_path).name}",
+                "size": {"width": width, "height": height}
+            }
+            
+            self.uploaded_images.append(image_info)
+            return len(self.uploaded_images) - 1
+            
+        except Exception as e:
+            raise Exception(f"画像の追加に失敗しました: {str(e)}")
+    
+    def clear_session(self):
+        """セッションをクリアし、アップロードされた画像を削除"""
+        # アップロードされたファイルを削除
+        for image_info in self.uploaded_images:
+            try:
+                if os.path.exists(image_info["path"]):
+                    os.remove(image_info["path"])
+            except:
+                pass
+        
+        self.uploaded_images = []
+        self.current_image_index = -1
+        self.current_image_path = None
+        self.current_image_data = None
+        
+    def download_image_from_url(self, url, filename_prefix="url_image"):
+        """URLから画像をダウンロードして一時ファイルとして保存"""
+        try:
+            # ヘッダーを設定してリクエスト送信
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            # Content-Typeから拡張子を推測
+            content_type = response.headers.get('Content-Type', '')
+            if 'jpeg' in content_type or 'jpg' in content_type:
+                ext = '.jpg'
+            elif 'png' in content_type:
+                ext = '.png'
+            elif 'gif' in content_type:
+                ext = '.gif'
+            elif 'webp' in content_type:
+                ext = '.webp'
+            else:
+                # URLから拡張子を推測
+                url_path = url.split('?')[0]
+                if url_path.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff')):
+                    ext = '.' + url_path.split('.')[-1].lower()
+                else:
+                    ext = '.jpg'
+            
+            # 一時ファイルを作成
+            uploads_dir = Path("uploads")
+            uploads_dir.mkdir(exist_ok=True)
+            
+            # ファイル名を生成
+            unique_id = str(uuid.uuid4())[:8]
+            filename = f"{filename_prefix}_{unique_id}{ext}"
+            temp_path = uploads_dir / filename
+            
+            # ファイルに保存
+            with open(temp_path, 'wb') as f:
+                f.write(response.content)
+                
+            # 画像として読み込み可能かテスト
+            with Image.open(temp_path) as img:
+                img.verify()
+                
+            return str(temp_path), filename
+            
+        except requests.RequestException as e:
+            raise Exception(f"URLからの画像取得に失敗しました: {str(e)}")
+        except Exception as e:
+            raise Exception(f"画像の処理に失敗しました: {str(e)}")
+    
+    def add_images_from_urls(self, urls):
+        """URLリストから画像をダウンロードして追加"""
+        results = []
+        
+        for i, url in enumerate(urls):
+            url = url.strip()
+            if not url:
+                continue
+                
+            try:
+                # URLから画像をダウンロード
+                temp_path, filename = self.download_image_from_url(url, f"url_image_{i+1}")
+                
+                # アップロードされた画像として追加
+                image_index = self.add_uploaded_image(temp_path, filename)
+                
+                results.append({
+                    "success": True,
+                    "url": url,
+                    "filename": filename,
+                    "index": image_index
+                })
+                
+            except Exception as e:
+                results.append({
+                    "success": False,
+                    "url": url,
+                    "error": str(e)
+                })
+                
+        return results
+
     def load_image(self, image_path):
         """画像を読み込み、ブラウザ表示用のデータを準備"""
         try:
@@ -98,8 +220,6 @@ class InteractiveSplitter:
                 for i in range(len(sorted_positions) - 1):
                     top = sorted_positions[i]
                     bottom = sorted_positions[i + 1]
-                    
-                    # 最小高さ制限を削除 - 1pxでも処理可能にする
                     
                     # セグメント番号による除外チェック
                     if segment_index in excluded_segments:
@@ -196,6 +316,200 @@ class InteractiveSplitter:
         except Exception as e:
             return {"error": str(e)}
 
+    def batch_process(self, cut_positions, skip_areas=None, excluded_segments=None, size_segments=None, global_numbering=True):
+        """全ての画像に対してバッチ処理を実行"""
+        if not self.uploaded_images:
+            return {"error": "処理する画像がありません"}
+        
+        if not self.current_sku:
+            return {"error": "SKU（商品コード）が入力されていません"}
+        
+        all_results = []
+        total_splits = 0
+        global_index = 1
+        
+        for i, image_info in enumerate(self.uploaded_images):
+            # 各画像を順番に処理
+            original_path = self.current_image_path
+            original_data = self.current_image_data
+            original_index = self.current_image_index
+            
+            try:
+                # 画像を読み込み
+                self.load_image(image_info['path'])
+                
+                # 分割処理を実行
+                if global_numbering:
+                    # グローバル番号付けの場合、segment_indexを調整
+                    result = self._split_with_global_numbering(
+                        cut_positions, skip_areas, excluded_segments, size_segments, global_index
+                    )
+                    if "error" not in result:
+                        total_splits += result['splits_created']
+                        global_index += result['splits_created']
+                else:
+                    result = self.split_by_positions(cut_positions, skip_areas, excluded_segments, size_segments)
+                    if "error" not in result:
+                        total_splits += result['splits_created']
+                
+                all_results.append({
+                    "image_filename": image_info['filename'],
+                    "image_index": i,
+                    "result": result
+                })
+                
+            except Exception as e:
+                all_results.append({
+                    "image_filename": image_info['filename'],
+                    "image_index": i,
+                    "result": {"error": str(e)}
+                })
+            
+            # 元の状態に戻す
+            self.current_image_path = original_path
+            self.current_image_data = original_data
+            self.current_image_index = original_index
+        
+        success_count = len([r for r in all_results if "error" not in r['result']])
+        error_count = len(all_results) - success_count
+        
+        return {
+            "success": True,
+            "total_images": len(self.uploaded_images),
+            "success_count": success_count,
+            "error_count": error_count,
+            "total_splits_created": total_splits,
+            "sku": self.current_sku,
+            "results": all_results
+        }
+    
+    def _split_with_global_numbering(self, cut_positions, skip_areas=None, excluded_segments=None, size_segments=None, start_index=1):
+        """グローバル番号付けでの分割処理"""
+        if not self.current_image_path or not cut_positions:
+            return {"error": "画像が読み込まれていないか、カット位置が指定されていません"}
+        
+        if skip_areas is None:
+            skip_areas = []
+        
+        if excluded_segments is None:
+            excluded_segments = []
+        
+        if size_segments is None:
+            size_segments = []
+        
+        try:
+            with Image.open(self.current_image_path) as img:
+                img_width, img_height = img.size
+                
+                # SKU毎の出力ディレクトリを作成
+                sku_output_path = Path("output") / "manual_split" / self.current_sku
+                sku_output_path.mkdir(parents=True, exist_ok=True)
+                
+                # カット位置をソートして、分割領域を定義
+                sorted_positions = sorted([0] + cut_positions + [img_height])
+                
+                split_info = []
+                segment_index = 1
+                global_segment_index = start_index
+                excluded_by_segment_count = 0
+                
+                for i in range(len(sorted_positions) - 1):
+                    top = sorted_positions[i]
+                    bottom = sorted_positions[i + 1]
+                    
+                    # セグメント番号による除外チェック
+                    if segment_index in excluded_segments:
+                        excluded_by_segment_count += 1
+                        segment_index += 1
+                        continue
+                    
+                    # 除外エリアと重複チェック
+                    is_in_skip_area = False
+                    for skip_area in skip_areas:
+                        skip_start = skip_area['start']
+                        skip_end = skip_area['end']
+                        
+                        if not (bottom <= skip_start or top >= skip_end):
+                            is_in_skip_area = True
+                            break
+                    
+                    if is_in_skip_area:
+                        segment_index += 1
+                        continue
+                    
+                    # 切り取り実行
+                    crop_box = (0, top, img_width, bottom)
+                    cropped = img.crop(crop_box)
+                    
+                    if cropped.mode in ('P', 'RGBA'):
+                        cropped = cropped.convert('RGB')
+                    
+                    # サイズサフィックスの確認
+                    has_size_suffix = segment_index in size_segments
+                    
+                    # 通常版を保存（グローバル番号使用）
+                    output_filename = f"{self.current_sku}_{global_segment_index:03d}.jpg"
+                    output_file_path = sku_output_path / output_filename
+                    
+                    cropped.save(
+                        output_file_path,
+                        format="JPEG",
+                        quality=95,
+                        optimize=True
+                    )
+                    
+                    split_info.append({
+                        "index": global_segment_index,
+                        "filename": output_filename,
+                        "crop_box": crop_box,
+                        "dimensions": (img_width, bottom - top),
+                        "size_kb": round(output_file_path.stat().st_size / 1024, 1),
+                        "sku": self.current_sku,
+                        "has_size_suffix": False,
+                        "download_url": f"/download/{self.current_sku}/{output_filename}"
+                    })
+                    
+                    # サイズサフィックス版も保存（該当する場合）
+                    if has_size_suffix:
+                        size_filename = f"{self.current_sku}_{global_segment_index:03d}-size.jpg"
+                        size_file_path = sku_output_path / size_filename
+                        
+                        cropped.save(
+                            size_file_path,
+                            format="JPEG",
+                            quality=95,
+                            optimize=True
+                        )
+                        
+                        split_info.append({
+                            "index": global_segment_index,
+                            "filename": size_filename,
+                            "crop_box": crop_box,
+                            "dimensions": (img_width, bottom - top),
+                            "size_kb": round(size_file_path.stat().st_size / 1024, 1),
+                            "sku": self.current_sku,
+                            "has_size_suffix": True,
+                            "download_url": f"/download/{self.current_sku}/{size_filename}"
+                        })
+                    
+                    segment_index += 1
+                    global_segment_index += 1
+                
+                skipped_count = len([area for area in skip_areas]) if skip_areas else 0
+                
+                return {
+                    "success": True,
+                    "splits_created": len(split_info),
+                    "skipped_areas": skipped_count,
+                    "excluded_segments": excluded_by_segment_count,
+                    "output_directory": str(sku_output_path),
+                    "sku": self.current_sku,
+                    "details": split_info
+                }
+                
+        except Exception as e:
+            return {"error": str(e)}
+
 # グローバルインスタンス
 interactive_splitter = InteractiveSplitter()
 
@@ -271,6 +585,9 @@ def upload_image():
         file_path = upload_dir / file.filename
         file.save(str(file_path))
         
+        # 画像をアップロード管理に追加
+        image_index = interactive_splitter.add_uploaded_image(file_path, file.filename)
+        
         # 画像を読み込み
         result = interactive_splitter.load_image(file_path)
         if "error" in result:
@@ -278,14 +595,183 @@ def upload_image():
             file_path.unlink(missing_ok=True)
             return jsonify(result)
         
+        # 現在の画像インデックスを設定
+        interactive_splitter.current_image_index = image_index
+        
         return jsonify({
             "success": True,
             "uploaded_file": str(file_path),
-            "image_data": result
+            "image_data": result,
+            "image_index": image_index,
+            "total_images": len(interactive_splitter.uploaded_images)
         })
         
     except Exception as e:
         return jsonify({"error": f"アップロードに失敗しました: {str(e)}"})
+
+@app.route('/api/upload_from_urls', methods=['POST'])
+def upload_from_urls():
+    """URLリストから画像をダウンロードしてアップロード"""
+    data = request.get_json()
+    urls = data.get('urls', [])
+    
+    if not urls:
+        return jsonify({"error": "URLが指定されていません"})
+    
+    # 改行区切りの文字列の場合は分割
+    if isinstance(urls, str):
+        urls = [line.strip() for line in urls.split('\n') if line.strip()]
+    
+    try:
+        results = interactive_splitter.add_images_from_urls(urls)
+        
+        success_count = len([r for r in results if r['success']])
+        error_count = len([r for r in results if not r['success']])
+        
+        # 最初の画像を現在の画像として設定
+        if success_count > 0 and interactive_splitter.uploaded_images:
+            first_image = interactive_splitter.uploaded_images[0]
+            image_result = interactive_splitter.load_image(first_image['path'])
+            interactive_splitter.current_image_index = 0
+        else:
+            image_result = None
+        
+        return jsonify({
+            "success": True,
+            "total_urls": len(urls),
+            "success_count": success_count,
+            "error_count": error_count,
+            "results": results,
+            "current_image": image_result,
+            "total_images": len(interactive_splitter.uploaded_images)
+        })
+        
+    except Exception as e:
+        return jsonify({"error": f"URL取得処理に失敗しました: {str(e)}"})
+
+@app.route('/api/navigate_image', methods=['POST'])
+def navigate_image():
+    """画像間のナビゲーション"""
+    data = request.get_json()
+    direction = data.get('direction')  # 'next' or 'prev'
+    
+    if not interactive_splitter.uploaded_images:
+        return jsonify({"error": "アップロードされた画像がありません"})
+    
+    total_images = len(interactive_splitter.uploaded_images)
+    current_index = interactive_splitter.current_image_index
+    
+    if direction == 'next':
+        new_index = (current_index + 1) % total_images
+    elif direction == 'prev':
+        new_index = (current_index - 1) % total_images
+    else:
+        return jsonify({"error": "無効な方向指定です"})
+    
+    # 新しい画像を読み込み
+    new_image = interactive_splitter.uploaded_images[new_index]
+    result = interactive_splitter.load_image(new_image['path'])
+    
+    if "error" not in result:
+        interactive_splitter.current_image_index = new_index
+        
+        return jsonify({
+            "success": True,
+            "image_data": result,
+            "current_index": new_index,
+            "total_images": total_images,
+            "filename": new_image['filename']
+        })
+    else:
+        return jsonify(result)
+
+@app.route('/api/clear_session', methods=['POST'])
+def clear_session():
+    """セッションをクリアし、アップロードされた画像を削除"""
+    try:
+        interactive_splitter.clear_session()
+        return jsonify({"success": True, "message": "セッションをクリアしました"})
+    except Exception as e:
+        return jsonify({"error": f"セッションクリアに失敗しました: {str(e)}"})
+
+@app.route('/api/upload_multiple', methods=['POST'])
+def upload_multiple():
+    """複数ファイルのアップロード"""
+    if 'files' not in request.files:
+        return jsonify({"error": "ファイルが選択されていません"})
+    
+    files = request.files.getlist('files')
+    if not files or len(files) == 0:
+        return jsonify({"error": "ファイルが選択されていません"})
+    
+    # 画像ファイルかチェック
+    allowed_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff'}
+    
+    upload_results = []
+    error_count = 0
+    
+    try:
+        # アップロードディレクトリを作成
+        upload_dir = Path("uploads")
+        upload_dir.mkdir(exist_ok=True)
+        
+        for file in files:
+            if file.filename == '':
+                continue
+                
+            file_ext = Path(file.filename).suffix.lower()
+            if file_ext not in allowed_extensions:
+                error_count += 1
+                upload_results.append({
+                    "filename": file.filename,
+                    "success": False,
+                    "error": "サポートされていないファイル形式です"
+                })
+                continue
+            
+            try:
+                # ファイルを保存
+                file_path = upload_dir / file.filename
+                file.save(str(file_path))
+                
+                # 画像をアップロード管理に追加
+                image_index = interactive_splitter.add_uploaded_image(file_path, file.filename)
+                
+                upload_results.append({
+                    "filename": file.filename,
+                    "success": True,
+                    "image_index": image_index
+                })
+                
+            except Exception as e:
+                error_count += 1
+                upload_results.append({
+                    "filename": file.filename,
+                    "success": False,
+                    "error": str(e)
+                })
+        
+        # 最初の画像を現在の画像として設定
+        success_count = len([r for r in upload_results if r['success']])
+        if success_count > 0 and interactive_splitter.uploaded_images:
+            first_image = interactive_splitter.uploaded_images[0]
+            image_result = interactive_splitter.load_image(first_image['path'])
+            interactive_splitter.current_image_index = 0
+        else:
+            image_result = None
+        
+        return jsonify({
+            "success": True,
+            "total_files": len(files),
+            "success_count": success_count,
+            "error_count": error_count,
+            "results": upload_results,
+            "current_image": image_result,
+            "total_images": len(interactive_splitter.uploaded_images)
+        })
+        
+    except Exception as e:
+        return jsonify({"error": f"アップロード処理に失敗しました: {str(e)}"})
 
 @app.route('/api/split_image', methods=['POST'])
 def split_image():
@@ -315,6 +801,41 @@ def split_image():
             })
         
         result = interactive_splitter.split_by_positions(actual_positions, actual_skip_areas, excluded_segments, size_segments)
+        return jsonify(result)
+    
+    return jsonify({"error": "画像が読み込まれていません"})
+
+@app.route('/api/batch_split', methods=['POST'])
+def batch_split():
+    """全ての画像に対してバッチ分割を実行"""
+    data = request.get_json()
+    cut_positions = data.get('cut_positions', [])
+    skip_areas = data.get('skip_areas', [])
+    excluded_segments = data.get('excluded_segments', [])
+    size_segments = data.get('size_segments', [])
+    global_numbering = data.get('global_numbering', True)
+    sku = data.get('sku', '')
+    
+    # SKUを設定
+    if sku.strip():
+        interactive_splitter.set_sku(sku)
+    
+    # ディスプレイ座標を実座標に変換
+    if interactive_splitter.current_image_data:
+        scale_factor = interactive_splitter.current_image_data['scale_factor']
+        actual_positions = [int(pos * scale_factor) for pos in cut_positions]
+        
+        # 除外エリアも実座標に変換
+        actual_skip_areas = []
+        for area in skip_areas:
+            actual_skip_areas.append({
+                'start': int(area['start'] * scale_factor),
+                'end': int(area['end'] * scale_factor)
+            })
+        
+        result = interactive_splitter.batch_process(
+            actual_positions, actual_skip_areas, excluded_segments, size_segments, global_numbering
+        )
         return jsonify(result)
     
     return jsonify({"error": "画像が読み込まれていません"})
@@ -374,6 +895,11 @@ def preview_splits():
 def serve_output(filename):
     """分割された画像ファイルを配信"""
     return send_from_directory('output', filename)
+
+@app.route('/uploads/<filename>')
+def serve_uploads(filename):
+    """アップロードされた画像ファイルを配信"""
+    return send_from_directory('uploads', filename)
 
 @app.route('/download/<sku>/<filename>')
 def download_file(sku, filename):
@@ -1747,7 +2273,7 @@ def create_templates():
                 return;
             }
             
-            try {
+            try:
                 document.getElementById('splitBtn').disabled = true;
                 document.getElementById('splitBtn').textContent = '処理中...';
                 
@@ -1782,13 +2308,12 @@ def create_templates():
                     showDownloadArea(data.details);
                 }
                 
-            } catch (error) {
+            except Exception as e:
                 showStatus('分割に失敗しました: ' + error.message, 'error');
-            } finally {
+            finally:
                 document.getElementById('splitBtn').disabled = false;
                 document.getElementById('splitBtn').textContent = '✂️ 分割実行';
                 updateSplitButtonState();
-            }
         }
 
         // ダウンロードエリアを表示
@@ -1988,7 +2513,7 @@ def create_templates():
             const formData = new FormData();
             formData.append('file', file);
             
-            try {
+            try:
                 const dropZone = document.getElementById('dropZone');
                 const originalContent = dropZone.innerHTML;
                 dropZone.innerHTML = '<div style="color: #667eea;">📤 アップロード中...</div>';
@@ -2003,7 +2528,7 @@ def create_templates():
                 if (data.error) {
                     showStatus('アップロードに失敗しました: ' + data.error, 'error');
                     dropZone.innerHTML = originalContent;
-                } else {
+                } else:
                     imageData = data.image_data;
                     displayImage(data.image_data);
                     updateImageInfo(data.image_data);
@@ -2016,10 +2541,9 @@ def create_templates():
                     `;
                 }
                 
-            } catch (error) {
+            except Exception as e:
                 showStatus('アップロードエラー: ' + error.message, 'error');
                 document.getElementById('dropZone').innerHTML = originalContent;
-            }
         }
 
         // モード切り替え
